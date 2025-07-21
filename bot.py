@@ -1,192 +1,147 @@
 import telebot
-from telebot import types
 import requests
-import json
-import os
+import os # <<< Додаємо імпорт модуля os
+import time
 
 # --- КОНФІГУРАЦІЯ БОТА ---
-# Отримайте свій токен бота від @BotFather у Telegram
-TELEGRAM_BOT_TOKEN = "7955277234:AAEhoBFDQcawuISjbJ_ZBiaD8Ctw5ko1ONg"
-# Отримайте свій Telegram ID користувача (наприклад, через @userinfobot),
-# щоб лише ви могли керувати ботом. Це число.
-AUTHORIZED_USER_ID = 5244460157 # ВСТАВТЕ_СВІЙ_ТЕЛЕГРАМ_ID_СЮДИ (як число)
-# URL до вашого застосунку на Windows. Якщо бот і застосунок на одному ПК, залиште 127.0.0.1
-# Якщо на різних, замініть 127.0.0.1 на IP-адресу ПК з Windows-застосунком.
+# Telegram Bot Token та Authorized User ID тепер будуть читатися зі змінних оточення!
+# НЕ ЗАЛИШАЙТЕ ТОКЕН І ID В КОДІ НА GITHUB!
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# Переконайтеся, що AUTHORIZED_USER_ID перетворюється на ціле число (int)
+AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID"))
+
+# URL до вашого застосунку на Windows.
+# Для локального запуску Windows-застосунку на тому ж ПК, що й бот (навіть якщо бот на Render),
+# це залишається 127.0.0.1.
+# Якщо ваш Windows-застосунок має бути доступний ззовні (наприклад, з Render),
+# вам знадобиться публічна IP-адреса вашого ПК та/або налаштування переадресації портів на роутері.
+# Наразі залишаємо так для тесту.
 WINDOWS_APP_URL = "http://127.0.0.1:5000"
+
+# Таймаут для запитів до застосунку Windows (у секундах)
+REQUEST_TIMEOUT = 5
 # --- КІНЕЦЬ КОНФІГУРАЦІЇ ---
+
+# Перевірка, чи встановлено токен та ID
+if not TELEGRAM_BOT_TOKEN:
+    print("Помилка: TELEGRAM_BOT_TOKEN не встановлено у змінних оточення.")
+    exit()
+if not AUTHORIZED_USER_ID:
+    print("Помилка: AUTHORIZED_USER_ID не встановлено у змінних оточення.")
+    exit()
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
-# Глобальні змінні для відстеження стану автоматичних режимів на стороні бота.
-# Фактичний стан контролюється Windows-застосунком.
-AUTO_MINUTE_OF_SILENCE_ENABLED = True
-AUTO_ALARM_ENABLED = False # Функціонал для авто-тривоги поки не реалізовано в Windows-апп
-
-# Функція для перевірки, чи користувач авторизований
-def is_authorized(message):
-    return str(message.from_user.id) == str(AUTHORIZED_USER_ID)
-
-# Функція для відправки команд на Windows-застосунок
-def send_command_to_windows_app(chat_id, command_type):
-    payload = {"command": command_type}
+# Функція для надсилання команд застосунку на Windows
+def send_command_to_windows_app(command):
     try:
-        response = requests.post(f"{WINDOWS_APP_URL}/command", json=payload, timeout=5) # Додаємо таймаут
-        if response.status_code == 200:
-            bot.send_message(chat_id, f"Команда '{command_type}' успішно відправлена.")
-            # Для команд зміни авто-режиму, оновлюємо стан бота
-            # Оголошення global тут має бути перед першим присвоєнням
-            global AUTO_MINUTE_OF_SILENCE_ENABLED # Оголошуємо global тут
-            global AUTO_ALARM_ENABLED # Оголошуємо global тут
-
-            if command_type == 'enable_auto_minute_of_silence':
-                AUTO_MINUTE_OF_SILENCE_ENABLED = True
-            elif command_type == 'disable_auto_minute_of_silence':
-                AUTO_MINUTE_OF_SILENCE_ENABLED = False
-            elif command_type == 'enable_auto_alarm': # Якщо буде реалізовано
-                AUTO_ALARM_ENABLED = True
-            elif command_type == 'disable_auto_alarm': # Якщо буде реалізовано
-                AUTO_ALARM_ENABLED = False
-        else:
-            bot.send_message(chat_id, f"Помилка при відправці команди '{command_type}': {response.status_code} - {response.text}")
-    except requests.exceptions.ConnectionError:
-        bot.send_message(chat_id, "Не вдалося підключитися до застосунку на Windows. Переконайтеся, що він запущений і доступний за адресою.")
+        response = requests.post(
+            f"{WINDOWS_APP_URL}/command",
+            json={"command": command},
+            timeout=REQUEST_TIMEOUT
+        )
+        response.raise_for_status() # Викличе виняток для HTTP помилок (4xx або 5xx)
+        print(f"Команда '{command}' успішно відправлена до застосунку Windows.")
+        return True
     except requests.exceptions.Timeout:
-        bot.send_message(chat_id, "Таймаут підключення до застосунку на Windows. Можливо, він зайнятий або недоступний.")
-    except Exception as e:
-        bot.send_message(chat_id, f"Виникла невідома помилка при відправці команди: {e}")
+        print(f"Помилка: Час очікування підключення до застосунку на Windows вичерпано для команди '{command}'.")
+        return False
+    except requests.exceptions.ConnectionError:
+        print(f"Помилка: Не вдалося підключитися до застосунку на Windows за адресою {WINDOWS_APP_URL}. Переконайтеся, що він запущений і доступний.")
+        return False
+    except requests.exceptions.RequestException as e:
+        print(f"Невідома помилка при відправленні команди '{command}' до застосунку Windows: {e}")
+        return False
 
-# --- МЕНЮ ТА КНОПКИ ---
+# --- ОБРОБНИКИ КОМАНД TELEGRAM ---
 
-def main_menu(chat_id):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
-    btn_minute = types.KeyboardButton("Хвилина Мовчання 🕯️")
-    btn_alarm = types.KeyboardButton("Тривога 🚨")
-    markup.add(btn_minute, btn_alarm)
-    bot.send_message(chat_id, "Оберіть розділ:", reply_markup=markup)
-
-def minute_of_silence_menu(chat_id):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
-    btn_auto = types.KeyboardButton("Автоматичний режим (Хвилина) 🔄")
-    btn_manual = types.KeyboardButton("Ручний режим (Хвилина) 🖐️")
-    btn_back = types.KeyboardButton("◀️ Назад до головного меню")
-    markup.add(btn_auto, btn_manual)
-    markup.add(btn_back)
-    bot.send_message(chat_id, "Оберіть режим для Хвилини Мовчання:", reply_markup=markup)
-
-def alarm_menu(chat_id):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
-    btn_auto = types.KeyboardButton("Автоматичний режим (Тривога) 🔄")
-    btn_manual = types.KeyboardButton("Ручний режим (Тривога) 🖐️")
-    btn_back = types.KeyboardButton("◀️ Назад до головного меню")
-    markup.add(btn_auto, btn_manual)
-    markup.add(btn_back)
-    bot.send_message(chat_id, "Оберіть режим для Тривоги:", reply_markup=markup)
-
-def manual_minute_of_silence_menu(chat_id):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
-    btn_play = types.KeyboardButton("Запустити Хвилину Мовчання негайно ▶️")
-    btn_stop = types.KeyboardButton("Припинити все ⏹️")
-    btn_back = types.KeyboardButton("◀️ Назад до Хвилини Мовчання")
-    markup.add(btn_play)
-    markup.add(btn_stop)
-    markup.add(btn_back)
-    bot.send_message(chat_id, "Ручне управління Хвилиною Мовчання:", reply_markup=markup)
-
-def manual_alarm_menu(chat_id):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
-    btn_alarm_on = types.KeyboardButton("Запустити Тривогу 🔔")
-    btn_alarm_off = types.KeyboardButton("Відбій Тривоги ✅")
-    btn_stop = types.KeyboardButton("Припинити все ⏹️")
-    btn_back = types.KeyboardButton("◀️ Назад до Тривоги")
-    markup.add(btn_alarm_on, btn_alarm_off)
-    markup.add(btn_stop)
-    markup.add(btn_back)
-    bot.send_message(chat_id, "Ручне управління Тривогою:", reply_markup=markup)
-
-def auto_minute_of_silence_menu(chat_id):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
-    status_text = "Увімкнено ✅" if AUTO_MINUTE_OF_SILENCE_ENABLED else "Вимкнено ❌"
-    btn_toggle = types.KeyboardButton(f"Перемкнути автозапуск (зараз: {status_text})")
-    btn_back = types.KeyboardButton("◀️ Назад до Хвилини Мовчання")
-    markup.add(btn_toggle)
-    markup.add(btn_back)
-    bot.send_message(chat_id, f"Автоматичний режим 'Хвилина Мовчання' (щодня о 08:59).\nСтатус: {status_text}", reply_markup=markup)
-
-def auto_alarm_menu(chat_id):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
-    status_text = "Увімкнено ✅" if AUTO_ALARM_ENABLED else "Вимкнено ❌"
-    btn_toggle = types.KeyboardButton(f"Перемкнути автозапуск (зараз: {status_text})")
-    btn_back = types.KeyboardButton("◀️ Назад до Тривоги")
-    markup.add(btn_toggle)
-    markup.add(btn_back)
-    bot.send_message(chat_id, f"Автоматичний режим 'Тривога' (функціонал у розробці).\nСтатус: {status_text}", reply_markup=markup)
-
-# --- ОБРОБНИКИ КОМАНД ТА ТЕКСТУ ---
-
-@bot.message_handler(commands=['start'])
+@bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    if not is_authorized(message):
-        bot.reply_to(message, "Ви не авторизовані для використання цього бота.")
-        return
-    bot.reply_to(message, "Привіт! Я бот для системи оповіщення. Оберіть дію:")
-    main_menu(message.chat.id)
-
-@bot.message_handler(func=lambda message: True)
-def handle_message(message):
-    if not is_authorized(message):
+    if message.from_user.id != AUTHORIZED_USER_ID:
         bot.reply_to(message, "Ви не авторизовані для використання цього бота.")
         return
 
-    # Оголошення глобальних змінних має бути на початку функції, якщо ви плануєте їх змінювати
-    global AUTO_MINUTE_OF_SILENCE_ENABLED
-    global AUTO_ALARM_ENABLED
+    markup = telebot.types.ReplyKeyboardMarkup(row_width=2)
+    itembtn1 = telebot.types.KeyboardButton('Запустити Тривогу 🔔')
+    itembtn2 = telebot.types.KeyboardButton('Запустити Відбій 🟢')
+    itembtn3 = telebot.types.KeyboardButton('Запустити Хвилину мовчання 🕯️')
+    itembtn4 = telebot.types.KeyboardButton('Зупинити все 🛑')
+    itembtn5 = telebot.types.KeyboardButton('Увімкнути авто Хвилину мовчання 🔄')
+    itembtn6 = telebot.types.KeyboardButton('Вимкнути авто Хвилину мовчання 🚫')
+    markup.add(itembtn1, itembtn2, itembtn3, itembtn4, itembtn5, itembtn6)
 
-    text = message.text
+    bot.reply_to(message, "Привіт! Я твій бот для керування звуками на Windows. Обирай дію:", reply_markup=markup)
 
-    if text == "Хвилина Мовчання 🕯️":
-        minute_of_silence_menu(message.chat.id)
-    elif text == "Тривога 🚨":
-        alarm_menu(message.chat.id)
-    elif text == "Автоматичний режим (Хвилина) 🔄":
-        auto_minute_of_silence_menu(message.chat.id)
-    elif text == "Ручний режим (Хвилина) 🖐️":
-        manual_minute_of_silence_menu(message.chat.id)
-    elif text == "Автоматичний режим (Тривога) 🔄":
-        auto_alarm_menu(message.chat.id)
-    elif text == "Ручний режим (Тривога) 🖐️":
-        manual_alarm_menu(message.chat.id)
-    elif text == "◀️ Назад до головного меню":
-        main_menu(message.chat.id)
-    elif text == "◀️ Назад до Хвилини Мовчання":
-        minute_of_silence_menu(message.chat.id)
-    elif text == "◀️ Назад до Тривоги":
-        alarm_menu(message.chat.id)
-    # Ручні команди відтворення/зупинки
-    elif text == "Запустити Хвилину Мовчання негайно ▶️":
-        send_command_to_windows_app(message.chat.id, "play_minute_of_silence")
-    elif text == "Запустити Тривогу 🔔":
-        send_command_to_windows_app(message.chat.id, "play_alarm")
-    elif text == "Відбій Тривоги ✅":
-        send_command_to_windows_app(message.chat.id, "play_all_clear")
-    elif text == "Припинити все ⏹️":
-        send_command_to_windows_app(message.chat.id, "stop_all_sounds")
-    # Перемикання автоматичних режимів
-    elif text.startswith("Перемкнути автозапуск (зараз:"):
-        # Перевіряємо, яка кнопка була натиснута, щоб оновити правильний стан
-        if "Хвилина)" in text:
-            AUTO_MINUTE_OF_SILENCE_ENABLED = not AUTO_MINUTE_OF_SILENCE_ENABLED
-            command = "enable_auto_minute_of_silence" if AUTO_MINUTE_OF_SILENCE_ENABLED else "disable_auto_minute_of_silence"
-            send_command_to_windows_app(message.chat.id, command)
-            # Оновлюємо меню після зміни стану
-            auto_minute_of_silence_menu(message.chat.id)
-        elif "Тривога)" in text:
-            AUTO_ALARM_ENABLED = not AUTO_ALARM_ENABLED
-            command = "enable_auto_alarm" if AUTO_ALARM_ENABLED else "disable_auto_alarm"
-            send_command_to_windows_app(message.chat.id, command)
-            # Оновлюємо меню після зміни стану
-            auto_alarm_menu(message.chat.id)
+@bot.message_handler(func=lambda message: message.text == 'Запустити Тривогу 🔔')
+def handle_alarm(message):
+    if message.from_user.id != AUTHORIZED_USER_ID:
+        bot.reply_to(message, "Ви не авторизовані для використання цього бота.")
+        return
+    if send_command_to_windows_app("play_alarm"):
+        bot.reply_to(message, "Команда 'Тривога' відправлена.")
     else:
-        bot.send_message(message.chat.id, "Невідома команда. Будь ласка, оберіть зі списку або натисніть /start.")
+        bot.reply_to(message, "Не вдалося відправити команду 'Тривога'. Перевірте консоль для деталей.")
+
+@bot.message_handler(func=lambda message: message.text == 'Запустити Відбій 🟢')
+def handle_all_clear(message):
+    if message.from_user.id != AUTHORIZED_USER_ID:
+        bot.reply_to(message, "Ви не авторизовані для використання цього бота.")
+        return
+    if send_command_to_windows_app("play_all_clear"):
+        bot.reply_to(message, "Команда 'Відбій' відправлена.")
+    else:
+        bot.reply_to(message, "Не вдалося відправити команду 'Відбій'. Перевірте консоль для деталей.")
+
+@bot.message_handler(func=lambda message: message.text == 'Запустити Хвилину мовчання 🕯️')
+def handle_minute_of_silence(message):
+    if message.from_user.id != AUTHORIZED_USER_ID:
+        bot.reply_to(message, "Ви не авторизовані для використання цього бота.")
+        return
+    if send_command_to_windows_app("play_minute_of_silence"):
+        bot.reply_to(message, "Команда 'Хвилина мовчання' відправлена.")
+    else:
+        bot.reply_to(message, "Не вдалося відправити команду 'Хвилина мовчання'. Перевірте консоль для деталей.")
+
+@bot.message_handler(func=lambda message: message.text == 'Зупинити все 🛑')
+def handle_stop_all(message):
+    if message.from_user.id != AUTHORIZED_USER_ID:
+        bot.reply_to(message, "Ви не авторизовані для використання цього бота.")
+        return
+    if send_command_to_windows_app("stop_all_sounds"):
+        bot.reply_to(message, "Команда 'Зупинити все' відправлена.")
+    else:
+        bot.reply_to(message, "Не вдалося відправити команду 'Зупинити все'. Перевірте консоль для деталей.")
+
+@bot.message_handler(func=lambda message: message.text == 'Увімкнути авто Хвилину мовчання 🔄')
+def handle_enable_auto_minute_of_silence(message):
+    if message.from_user.id != AUTHORIZED_USER_ID:
+        bot.reply_to(message, "Ви не авторизовані для використання цього бота.")
+        return
+    if send_command_to_windows_app("enable_auto_minute_of_silence"):
+        bot.reply_to(message, "Автоматичну Хвилину мовчання увімкнено.")
+    else:
+        bot.reply_to(message, "Не вдалося увімкнути автоматичну Хвилину мовчання.")
+
+@bot.message_handler(func=lambda message: message.text == 'Вимкнути авто Хвилину мовчання 🚫')
+def handle_disable_auto_minute_of_silence(message):
+    if message.from_user.id != AUTHORIZED_USER_ID:
+        bot.reply_to(message, "Ви не авторизовані для використання цього бота.")
+        return
+    if send_command_to_windows_app("disable_auto_minute_of_silence"):
+        bot.reply_to(message, "Автоматичну Хвилину мовчання вимкнено.")
+    else:
+        bot.reply_to(message, "Не вдалося вимкнути автоматичну Хвилину мовчання.")
+
+# --- ЗАПУСК БОТА ---
 
 print("Бот запущено. Очікую команди...")
-bot.polling(none_stop=True)
+# Використовуємо poll() з обробкою помилок для підвищення стабільності
+# Додаємо interval=0 для швидкого реагування
+# Додаємо timeout=30 для запобігання зависанню при довгих опитуваннях
+while True:
+    try:
+        bot.polling(none_stop=True, interval=0, timeout=30)
+    except Exception as e:
+        print(f"Помилка в циклі polling бота: {e}")
+        # Затримка перед повторною спробою, щоб уникнути спаму запитами
+        time.sleep(5)
